@@ -1,0 +1,13 @@
+{
+  "target_sample_rate": 250,
+  "low_cut_hz": 0.5,
+  "high_cut_hz": 45,
+  "highpass_transition_hz": 0.5,
+  "lowpass_transition_hz": 10,
+  "window_seconds": 5,
+  "line_frequency_hz": 60,
+  "reference": "original",
+  "detect_flatline": true,
+  "detect_jumps": true,
+  "mask_scope": "channel_sample"
+}
