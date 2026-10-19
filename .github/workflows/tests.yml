@@ -1,5 +1,7 @@
 name: Tests
 on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
 jobs:
   cpu-tests:
     runs-on: ubuntu-latest
@@ -16,3 +18,12 @@ jobs:
       - name: Check wheel resources
         run: |
           python -c "import glob, zipfile; z=zipfile.ZipFile(glob.glob('dist/*.whl')[0]); assert 'eeg_siamese/configs/axial_transformer.json' in z.namelist()"
+      - name: Capture CI environment
+        if: always()
+        run: python scripts/capture_environment.py --output artifacts/ci-environment.json
+      - name: Upload CI environment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-environment
+          path: artifacts/ci-environment.json

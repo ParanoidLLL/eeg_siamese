@@ -4,6 +4,12 @@
 
 本仓库只有完整轴向方案，不包含原始EEG、预处理数据、训练权重或注册库。已完成实验为源20人两日期训练、新10人S1注册/S2测试，18/20=90%；它是单数据集、单种子、20条相关阶段记录的结果，不代表跨数据集普遍性能。详见[结果与限制](docs/RESULTS.md)。
 
+## 本地项目
+
+当前目录是唯一维护的源码版本，直接用VS Code打开本目录即可。旧上传副本、ZIP和工作备份已移到项目外归档，不需要解压、复制或进入另一套源码目录。
+
+本地Git仍在 `release` 分支，保留原历史；旧云端仓库已删除，失效的远程关联已移除。[重新上传与日常提交](docs/UPLOAD.md)说明如何从VS Code连接新仓库。
+
 ## 安装
 
 Python3.10或更高版本。在仓库根目录：
@@ -21,7 +27,7 @@ GPU训练需安装适配运行机器的PyTorch；`--device cpu`可验证流程�
 
 ## 从数据到测试
 
-1. 自行获取具有使用权限的OpenBMI运动想象MAT文件，放入data/raw，或修改examples中的CSV路径。模板包含S01–S30两日期的预期文件名，不包含数据。
+1. 按[数据来源与下载步骤](docs/DATA.md#数据来源与下载)获取具有使用权限的OpenBMI运动想象MAT文件，放入data/raw，或修改examples中的CSV路径。模板包含S01–S30两日期的预期文件名，不包含数据。
 2. 分别转换源20人和目标10人。显式指定物理单位；默认处理为250Hz、0.5–45Hz、5秒窗和逐通道采样掩码。
 
 ```sh
@@ -35,7 +41,11 @@ python -m eeg_siamese.cli convert-openbmi --index examples/openbmi_target10.csv 
 python scripts/prepare_manifests.py --source data/processed/source20/manifest.csv --target data/processed/target10/manifest.csv --output-dir data/splits/source20_target10
 ```
 
-4. 用转换生成的配置训练、冻结、注册和测试。
+4. 用转换生成的配置训练、冻结、注册和测试。开始前记录实际运行机器的环境：
+
+```sh
+python scripts/capture_environment.py --output artifacts/axial_run/environment.json
+```
 
 ```sh
 python scripts/run_pipeline.py --config data/processed/source20/general.json --train-manifest data/splits/source20_target10/train.csv --enroll-manifest data/splits/source20_target10/enroll.csv --query-manifest data/splits/source20_target10/query.csv --output-dir artifacts/axial_run --device cuda
@@ -63,13 +73,18 @@ docs/                    模型说明、输入约定和实验结果
 .github/workflows/        CPU测试与打包检查
 ```
 
-运行产物在artifacts/，数据在data/，两者均被Git忽略。模型配置使用62电极是当前OpenBMI实验设置；换数据集须核对单位、采样率、电极名称顺序和日期协议，并重新训练，不强行加载不兼容权重。
+本地运行产物在 `artifacts/`，完整汇报在 `reports/`，原始或处理数据按需放在 `data/`，Python环境在 `.venv/`；这些目录均被Git忽略。源码和说明文档以当前目录中的版本为准。模型配置使用62电极是当前OpenBMI实验设置；换数据集须核对单位、采样率、电极名称顺序和日期协议，并重新训练，不强行加载不兼容权重。
 
 ## 更多说明
 
 - [模型原理与训练目标](docs/MODEL.md)
 - [数据约定和复现边界](docs/DATA.md)
 - [实验结果与TensorBoard图](docs/RESULTS.md)
-- [上传仓库的步骤](UPLOAD.md)
+- [环境版本与复现边界](docs/ENVIRONMENT.md)
+- [更新上传与仓库设置](docs/UPLOAD.md)
 
 默认35轮来自源身份五折开发选择。最终目标S2不用于选权重、早停、调参或阈值；若依据目标错误调整方案，必须另留测试数据。修改默认配置时，同步configs与src/eeg_siamese/configs中的模板，测试会检查一致性。
+
+## 授权状态
+
+按所有者选择，暂不提供开源许可证或额外开源使用授权。原始数据及第三方依赖遵循各自条款。

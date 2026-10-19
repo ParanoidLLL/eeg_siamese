@@ -1,5 +1,22 @@
 # 数据与复现约定
 
+## 数据来源与下载
+
+本项目使用 OpenBMI 的运动想象（MI）部分。原始数据论文覆盖54名受试者、不同日期的两次采集及MI、ERP、SSVEP三类范式；本项目仅选取S01–S30的MI文件，不把原论文的任务分类成绩当作身份识别基线。
+
+- 数据存档：[GigaDB 100542](https://gigadb.org/dataset/100542)，持久标识：[10.5524/100542](https://doi.org/10.5524/100542)。
+- 原始论文：Lee, M.-H., et al. (2019). *EEG dataset and OpenBMI toolbox for three BCI paradigms: an investigation into BCI illiteracy*. GigaScience, 8(5), giz002. [DOI](https://doi.org/10.1093/gigascience/giz002)。
+- 作者工具箱：[PatternRecognition/OpenBMI](https://github.com/PatternRecognition/OpenBMI)。本Python项目不依赖安装该MATLAB工具箱。
+
+下载步骤：
+
+1. 打开GigaDB存档，查看文件列表及数据使用条款，选择MI文件；不要下载ERP或SSVEP替代MI。
+2. 获取S01–S30各自session1和session2的MAT文件，共60份，保留文件名，例如 `sess01_subj01_EEG_MI.mat`、`sess02_subj01_EEG_MI.mat`。下载服务和目录可能调整，以存档提供的入口为准。
+3. 将这60份文件放到仓库 `data/raw/`；若保留下载目录层级，则修改 `examples/*.csv` 的path列。路径相对于对应CSV所在目录解析。
+4. 按README转换和生成训练/注册/查询清单。S01–S20两日期训练；S21–S30的S1仅注册、S2仅测试。先核对文件完整性、单位和电极顺序，再训练。
+
+原数据、作者工具箱和本项目代码的授权范围应分别核对；本仓库不重新分发原始数据，也不替原数据提供额外授权。若研究使用这些数据，请引用原始论文与数据存档。
+
 ## 输入
 
 原始OpenBMI索引为path,subject_id,session_id，身份及日期为数字。相对路径以索引CSV的目录解析：examples模板中的../data/raw指向仓库data/raw。读取普通MAT，物理单位必须显式给V或uV；不要把设备ADC数值直接当微伏。
