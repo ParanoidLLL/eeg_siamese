@@ -1,90 +1,65 @@
-# Quality Aware Axial EEG Transformer
+# W：对数功率残差轴向 Transformer 脑纹识别
 
-用于跨日期 EEG 身份识别的轴向 Transformer。模型保留电极与时间片两个维度，结合硬掩码、软质量注意力和污染一致性训练，将记录编码为128维身份向量，再通过注册模板的余弦相似度识别人。
+发布版本 **1.2.0**。W保留原质量感知轴向Transformer的波形通路，在每个窗口的隐藏特征上加入对数功率残差，再沿用质量加权池化、128维身份向量和余弦匹配。
 
-本仓库只有完整轴向方案，不包含原始EEG、预处理数据、训练权重或注册库。已完成实验为源20人两日期训练、新10人S1注册/S2测试，18/20=90%；它是单数据集、单种子、20条相关阶段记录的结果，不代表跨数据集普遍性能。详见[结果与限制](docs/RESULTS.md)。
+训练主线是 **Q预训练 → W继续训练**。新增谱分支末层为零，W起点与Q预测等价；波形主干与谱分支共同训练。可同时训练等新增预算的原模型续训对照U。训练统计只拟合训练清单中的记录，注册和查询不参与拟合。
 
-## 本地项目
+## 安装与验证
 
-当前目录是唯一维护的源码版本，直接用VS Code打开本目录即可。旧上传副本、ZIP和工作备份已移到项目外归档，不需要解压、复制或进入另一套源码目录。
-
-本地Git仍在 `release` 分支，保留原历史；旧云端仓库已删除，失效的远程关联已移除。[重新上传与日常提交](docs/UPLOAD.md)说明如何从VS Code连接新仓库。
-
-## 安装
-
-Python3.10或更高版本。在仓库根目录：
+Python 3.10+，在仓库根目录执行：
 
 ```sh
 python -m venv .venv
-# macOS或Linux
+# macOS/Linux
 source .venv/bin/activate
-# Windows PowerShell 使用 .venv/Scripts/Activate.ps1
+# Windows PowerShell：.venv/Scripts/Activate.ps1
 python -m pip install -e ".[test,monitor]"
 python -m pytest -q
+python -m eeg_siamese.cli train-w --help
 ```
 
-GPU训练需安装适配运行机器的PyTorch；`--device cpu`可验证流程，`--device cuda`使用可用CUDA设备。本项目不自动下载数据或权重。GitHub Actions使用CPU运行机制测试。
+GPU训练使用已安装的兼容PyTorch和`--device cuda`，CPU流程验证用`--device cpu`。项目不自动下载EEG或权重。
 
-## 从数据到测试
+## 训练W
 
-1. 按[数据来源与下载步骤](docs/DATA.md#数据来源与下载)获取具有使用权限的OpenBMI运动想象MAT文件，放入data/raw，或修改examples中的CSV路径。模板包含S01–S30两日期的预期文件名，不包含数据。
-2. 分别转换源20人和目标10人。显式指定物理单位；默认处理为250Hz、0.5–45Hz、5秒窗和逐通道采样掩码。
+先按[数据约定](docs/DATA.md)将OpenBMI源身份转换为带单位、通道顺序、采样率与硬掩码的NPZ，训练CSV格式为`subject_id,session_id,record_id,path`。相对数据路径以CSV目录解析。源身份必须与后续未见身份评估人员分离；跨日期训练时每个源身份要有两日期。
 
 ```sh
-python -m eeg_siamese.cli convert-openbmi --index examples/openbmi_source20.csv --input-unit uV --config configs/preprocessing.quality.json --output-dir data/processed/source20
-python -m eeg_siamese.cli convert-openbmi --index examples/openbmi_target10.csv --input-unit uV --config configs/preprocessing.quality.json --output-dir data/processed/target10
+python -m eeg_siamese.cli train-w --manifest data/splits/train.csv --config configs/w_openbmi.json --output-dir artifacts/w_run --device cuda --control
 ```
 
-3. 生成清单。源身份两日期全部用于训练；目标身份只用session_1注册、session_2查询。脚本检查训练/目标身份隔离、注册/查询日期隔离以及每名源身份至少两日期。
+默认Q训练35轮，U/W分别从同一Q起点新增35轮，每轮100步、4人×2个跨日期样本、SupCon加0.5污染一致性。`--control`额外训练U；省略则仅训练Q与W。阶段轮数由配置`training.epochs`指定，`--warmup-epochs`可单独设置Q轮数。命令只训练，不自动注册、测试或选择最好种子。输出目录须为空，避免覆盖已有模型。
+
+主要产物：
+
+- `artifacts/w_run/model.pt`：可直接用于原注册/预测命令的W单编码器；不含训练包装器中的冻结Q或优化器。
+- `Q/`、`W/`、可选`U/`：固定终点模型、完整恢复状态、各阶段实际配置及日志。
+- `spectral_statistics.json`：训练记录来源哈希、逐特征统计与拟合方式。
+- `COMPLETE.json`：训练预算、输入清单/配置和最终模型哈希；不填造测试准确率。
+
+[详细W流程与断点恢复](docs/W_MODEL.md)。原`train`、注册、校准、预测和评估入口继续可用。`train-w`是两阶段流程，不能将尚未拟合统计的`w_openbmi.json`直接交给旧`train`入口。
+
+## 注册与评估
 
 ```sh
-python scripts/prepare_manifests.py --source data/processed/source20/manifest.csv --target data/processed/target10/manifest.csv --output-dir data/splits/source20_target10
+python -m eeg_siamese.cli enroll --checkpoint artifacts/w_run/model.pt --manifest data/splits/enroll.csv --output artifacts/w_run/gallery.json --device cuda
+python -m eeg_siamese.cli evaluate --checkpoint artifacts/w_run/model.pt --gallery artifacts/w_run/gallery.json --manifest data/splits/query.csv --output artifacts/w_run/evaluation.json --closed-set --device cuda
 ```
 
-4. 用转换生成的配置训练、冻结、注册和测试。开始前记录实际运行机器的环境：
+这是闭集身份识别。开集拒识仍须按原流程使用独立开发人员校准阈值，不能拿闭集准确率代替开集能力。每次评估前冻结检查点与协议。
 
-```sh
-python scripts/capture_environment.py --output artifacts/axial_run/environment.json
-```
+## 已有证据
 
-```sh
-python scripts/run_pipeline.py --config data/processed/source20/general.json --train-manifest data/splits/source20_target10/train.csv --enroll-manifest data/splits/source20_target10/enroll.csv --query-manifest data/splits/source20_target10/query.csv --output-dir artifacts/axial_run --device cuda
-```
+OpenBMI源20人五折跨日期复核、三个种子的固定终点均值：Q **90.00%**，等新增预算U **91.67%**，W **97.50%**；主要比较W−U为+5.83个百分点，按人区间[0,14.17]个百分点。源20曾用于开发，协议是每折1:4、完整阶段记录汇总；不是新最终10人的成绩，也不能与不同图库规模或32秒方案直接排名。
 
-5. 查看当前运行的实际结果和曲线。
+EEGMMIDB冻结复评中Q为80.26%、W为87.50%，该19人此前也已分析过。两个数据来源都支持保留W候选，但不证明任意数据集或学校干电极设备都能获得同样收益。[完整结果边界](docs/W_RESULTS.md)。
 
-```sh
-python scripts/plot_results.py --run-dir artifacts/axial_run --tensorboard-dir artifacts/tensorboard
-python -m tensorboard.main --logdir artifacts/tensorboard --host 127.0.0.1 --port 6006
-```
+## 版本与目录
 
-浏览器打开http://127.0.0.1:6006/。最终测试准确率是一个固定评估点，不是每轮目标测试曲线。脚本不会把示例90%成绩写入新实验。
+当前GitHub发布线为`release`，1.2.0在1.1基础上加入W训练和导出流程。原质量感知Q配置与命令保留；W使用独立的`train-w`配方，配置中的数据协议须与自己的信号一致。[更新记录](CHANGELOG.md) · [提交和推送](docs/UPLOAD.md)。
 
-## 结构
+`src/eeg_siamese/`为核心实现，`configs/`及包内`configs/`为同步模板，`examples/`为相对路径索引，`scripts/`为通用工具，`tests/`为机制和流程测试。已验证研究核心模块保留以兼容现有检查点，常用W流程通过上述入口执行；研究用Windows训练队列不包含在通用发布入口中。
 
-```text
-configs/                  用户可编辑的模型与预处理配置
-examples/                 相对路径的数据索引模板
-src/eeg_siamese/           轴向模型、质量、数据、训练和推理
-src/eeg_siamese/configs/   随Python包分发的默认配置模板
-scripts/                  清单划分、训练注册测试、可视化
-tests/                   信号与训练流程回归测试
-docs/                    模型说明、输入约定和实验结果
-.github/workflows/        CPU测试与打包检查
-```
+数据、模型权重、注册库、环境和运行日志留在被忽略的`data/`、`artifacts/`、`reports/`及`.venv/`。Git版本提供算法实现，不包含一个已完成全源训练的新最终权重；现有五折权重也不是全20人训练的部署模型。
 
-本地运行产物在 `artifacts/`，完整汇报在 `reports/`，原始或处理数据按需放在 `data/`，Python环境在 `.venv/`；这些目录均被Git忽略。源码和说明文档以当前目录中的版本为准。模型配置使用62电极是当前OpenBMI实验设置；换数据集须核对单位、采样率、电极名称顺序和日期协议，并重新训练，不强行加载不兼容权重。
-
-## 更多说明
-
-- [模型原理与训练目标](docs/MODEL.md)
-- [数据约定和复现边界](docs/DATA.md)
-- [实验结果与TensorBoard图](docs/RESULTS.md)
-- [环境版本与复现边界](docs/ENVIRONMENT.md)
-- [更新上传与仓库设置](docs/UPLOAD.md)
-
-默认35轮来自源身份五折开发选择。最终目标S2不用于选权重、早停、调参或阈值；若依据目标错误调整方案，必须另留测试数据。修改默认配置时，同步configs与src/eeg_siamese/configs中的模板，测试会检查一致性。
-
-## 授权状态
-
-按所有者选择，暂不提供开源许可证或额外开源使用授权。原始数据及第三方依赖遵循各自条款。
+按所有者选择，暂不提供开源许可证或额外开源使用授权。数据和第三方依赖遵循各自条款。

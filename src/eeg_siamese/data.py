@@ -70,10 +70,17 @@ class Record:
     session_id: str
     record_id: str
     path: Path
+    task_id: str | None = None
+    run_id: str | None = None
 
     def metadata(self):
-        return dict(subject_id=self.subject_id, session_id=self.session_id,
-                    record_id=self.record_id, path=str(self.path))
+        result = dict(subject_id=self.subject_id, session_id=self.session_id,
+                      record_id=self.record_id, path=str(self.path))
+        if self.task_id is not None:
+            result['task_id'] = self.task_id
+        if self.run_id is not None:
+            result['run_id'] = self.run_id
+        return result
 
 
 def read_manifest(path, allow_missing=False):
@@ -94,7 +101,9 @@ def read_manifest(path, allow_missing=False):
                 raise ValueError(f"Missing EEG file: {source}")
             if values["subject_id"] == "Unknown":
                 raise ValueError("Use actual identity IDs; Unknown is reserved for predictions")
-            records.append(Record(values["subject_id"], values["session_id"], values["record_id"], source))
+            records.append(Record(values["subject_id"], values["session_id"], values["record_id"], source,
+                                  (row.get('task_id') or '').strip() or None,
+                                  (row.get('run_id') or '').strip() or None))
     if not records:
         raise ValueError("Manifest is empty")
     if len({r.record_id for r in records}) != len(records):
@@ -107,6 +116,8 @@ def read_manifest(path, allow_missing=False):
 def load_windows(record, config):
     """Strict adapter boundary; filtering/resampling belongs to source adapters."""
     with np.load(record.path, allow_pickle=False) as archive:
+        if "requires_event_windowing" in archive and bool(archive["requires_event_windowing"].item()):
+            raise ValueError(f"{record.record_id}: continuous event-preserving data requires event-aware windowing first")
         required = {"eeg", "sample_rate", "channel_names", "unit"}
         if not required.issubset(archive.files):
             raise ValueError(f"{record.path}: missing NPZ metadata {required - set(archive.files)}")
@@ -126,6 +137,10 @@ def load_windows(record, config):
         if eeg.ndim != 2 or eeg.shape[0] != len(config.channel_names):
             raise ValueError(f"{record.record_id}: expected EEG [channels,samples]")
         count = eeg.shape[1] // config.window_samples
+        if 'trial_samples' in archive:
+            trial_samples = int(archive['trial_samples'].item())
+            if config.window_samples != trial_samples or eeg.shape[1] % trial_samples:
+                raise ValueError(f'{record.record_id}: windows must preserve stored trial boundaries')
         if count == 0:
             raise ValueError(f"{record.record_id}: shorter than one complete window")
         windows = eeg[:, :count * config.window_samples].reshape(
@@ -217,11 +232,14 @@ def pad_quality(quality, start, block_windows):
 
 
 class RecordingDataset(Dataset):
-    def __init__(self, records, config, cache=False, cache_max_bytes=512 * 1024 * 1024):
+    def __init__(self, records, config, cache=False, cache_max_bytes=512 * 1024 * 1024, task_names=()):
         self.records = records
         self.config = config
         self.identities = {s: i for i, s in enumerate(sorted({r.subject_id for r in records}))}
         self.sessions = {s: i for i, s in enumerate(sorted({r.session_id for r in records}))}
+        self.task_names = tuple(task_names)
+        if self.task_names and any(r.task_id not in self.task_names for r in records):
+            raise ValueError('Every training record requires a known explicit task_id')
         self.cache = cache
         self.cache_max_bytes = cache_max_bytes
         self._cache = OrderedDict()
@@ -261,6 +279,8 @@ class RecordingDataset(Dataset):
         start = int(eligible[torch.randint(len(eligible), ())])
         x, mask = padded_block(windows, valid, start, k)
         labels = (self.identities[record.subject_id], self.sessions[record.session_id])
+        if self.task_names:
+            labels += (self.task_names.index(record.task_id),)
         if len(loaded) == 3:
             q = pad_quality(loaded[2], start, k)
             return x, mask, q, *labels
@@ -269,7 +289,7 @@ class RecordingDataset(Dataset):
 
 class SessionBatchSampler(Sampler):
     def __init__(self, records, identities_per_batch, samples_per_identity,
-                 steps, seed=42, cross_session=True):
+                 steps, seed=42, cross_session=True, same_session_batch=False):
         self.groups = {}
         for index, record in enumerate(records):
             self.groups.setdefault(record.subject_id, {}).setdefault(record.session_id, []).append(index)
@@ -278,6 +298,14 @@ class SessionBatchSampler(Sampler):
         self.steps = steps
         self.seed = seed
         self.epoch = 0
+        self.same_session_batch = same_session_batch
+        if same_session_batch:
+            if cross_session:
+                raise ValueError('Same-session batches cannot require cross-session positives')
+            common = set.intersection(*(set(g) for g in self.groups.values()))
+            self.common_sessions = sorted(s for s in common if all(len(g[s]) >= self.k for g in self.groups.values()))
+            if not self.common_sessions:
+                raise ValueError('Need a shared task with enough distinct records per identity')
         if not 2 <= self.p <= len(self.groups) or self.k < 2 or steps < 1:
             raise ValueError("Batch requires >=2 identities, >=2 samples each and positive steps")
         if cross_session and any(len(sessions) < 2 for sessions in self.groups.values()):
@@ -291,6 +319,12 @@ class SessionBatchSampler(Sampler):
         identities = list(self.groups)
         for _ in range(self.steps):
             batch = []
+            if self.same_session_batch:
+                session = str(rng.choice(self.common_sessions))
+                for identity in rng.choice(identities, self.p, replace=False):
+                    batch.extend(int(i) for i in rng.choice(self.groups[identity][session], self.k, replace=False))
+                yield batch
+                continue
             for identity in rng.choice(identities, self.p, replace=False):
                 sessions = list(self.groups[identity])
                 rng.shuffle(sessions)

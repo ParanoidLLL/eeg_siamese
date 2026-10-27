@@ -1,7 +1,8 @@
 import math
+import json
 import random
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -30,6 +31,7 @@ class TrainConfig:
     metric_loss: str = "supcon"
     pair_margin: float = 1.0
     cross_session: bool = True
+    same_session_batch: bool = False
     seed: int = 42
     eval_every: int = 1
     cache_records: bool = True
@@ -39,8 +41,35 @@ class TrainConfig:
     corruption_channel_fraction: float = 0.2
     corruption_noise_uv: float = 30.0
     early_stopping_evaluations: int = 0
+    gate_regularization_weight: float = 0.0
+    selector_lr_multiplier: float = 1.0
+    window_reliability_weight: float = 0.0
+    window_reliability_temperature: float = .1
+    local_power_mode: str = 'none'
+    local_power_margin_weight: float = .5
+    fusion_reference: str = ''
+    fusion_reference_sha256: str = ''
+    fusion_branch_weight: float = 1.
+    modulation_reference: str = ''
+    modulation_reference_sha256: str = ''
 
     def __post_init__(self):
+        if not math.isfinite(self.fusion_branch_weight) or self.fusion_branch_weight<0:
+            raise ValueError('Fusion branch supervision must be nonnegative')
+        if not isinstance(self.same_session_batch, bool) or (self.same_session_batch and self.cross_session):
+            raise ValueError('Same-session batches require cross_session=False')
+        if self.local_power_mode not in ('none','augment','margin'):
+            raise ValueError('Unknown local_power_mode')
+        if not math.isfinite(self.local_power_margin_weight) or self.local_power_margin_weight<=0:
+            raise ValueError('Local power margin weight must be positive')
+        if not math.isfinite(self.window_reliability_weight) or self.window_reliability_weight<0:
+            raise ValueError('Window reliability weight must be nonnegative')
+        if not math.isfinite(self.window_reliability_temperature) or self.window_reliability_temperature<=0:
+            raise ValueError('Window reliability temperature must be positive')
+        if not math.isfinite(self.selector_lr_multiplier) or self.selector_lr_multiplier<=0:
+            raise ValueError('selector_lr_multiplier must be finite and positive')
+        if not math.isfinite(self.gate_regularization_weight) or self.gate_regularization_weight < 0:
+            raise ValueError('Invalid gate regularization weight')
         counts = (self.epochs, self.steps_per_epoch, self.identities_per_batch, self.samples_per_identity,
                   self.eval_every)
         if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in counts):
@@ -113,7 +142,7 @@ def _development_provenance(episodes):
 
 def _record(metadata):
     return Record(metadata['subject_id'], metadata['session_id'], metadata['record_id'],
-                  Path(metadata['path']))
+                  Path(metadata['path']), metadata.get('task_id'), metadata.get('run_id'))
 
 
 def _merge_records(*groups):
@@ -125,6 +154,8 @@ def _merge_records(*groups):
             if previous is not None and (previous['subject_id'], previous['session_id'], previous['path']) != (
                     row['subject_id'], row['session_id'], row['path']):
                 raise ValueError('record_id collides with prior data; use globally unique record identifiers')
+            if previous is not None and any(previous.get(k) != row.get(k) for k in ('task_id', 'run_id')):
+                raise ValueError('Prior task_id/run_id metadata changed')
             physical = physical_files.get(row['path'])
             if physical is not None and physical != (row['record_id'], row['subject_id'], row['session_id']):
                 raise ValueError('A prior EEG file was relabeled; preserve its identity and record_id')
@@ -160,6 +191,21 @@ def _load_initialization(encoder, path, data_config, init_mode):
     return initial, loaded
 
 
+def _load_modulation_reference(encoder,path,data_config):
+    initial=torch.load(path,map_location='cpu',weights_only=True)
+    if initial.get('schema_version')!=1 or EncoderConfig(**initial['encoder_config'])!=replace(encoder.config,spectral_modulation='none'):
+        raise ValueError('Modulation reference must be identical W without modulation')
+    if DataConfig(**initial['data_config'])!=data_config:
+        raise ValueError('Modulation reference preprocessing changed')
+    expected=set(encoder.state_dict())-set(initial['encoder_state'])
+    if any(not k.startswith('spectral_modulator.') for k in expected):
+        raise ValueError('Only modulation parameters may be newly initialized')
+    mismatch=encoder.load_state_dict(initial['encoder_state'],strict=False)
+    if mismatch.unexpected_keys or set(mismatch.missing_keys)!=expected:
+        raise ValueError('Unexpected modulation reference keys')
+    return initial,list(initial['encoder_state'])
+
+
 @contextmanager
 def _tensorboard_writer(log_dir, start_epoch):
     if log_dir is None:
@@ -182,7 +228,8 @@ def _tensorboard_writer(log_dir, start_epoch):
 
 
 def train(records, config_path, output, device, initialization=None, resume=None,
-          dev_episodes=None, init_mode='strict', tensorboard_dir=None, dev_closed_set=False):
+          dev_episodes=None, init_mode='strict', tensorboard_dir=None, dev_closed_set=False,
+          dev_evaluator=None):
     """Train an encoder; best model is selected on unseen development episodes.
 
     ``output`` contains the best evaluated epoch (the final epoch without dev).
@@ -209,7 +256,30 @@ def train(records, config_path, output, device, initialization=None, resume=None
     options = dict(config.get('encoder', {}))
     options.setdefault('channels', len(data_config.channel_names))
     encoder_config = EncoderConfig(**options)
+    if encoder_config.spectral_fusion!='none':
+        if not math.isclose(encoder_config.sample_rate,data_config.sample_rate) or not math.isclose(encoder_config.spectral_input_scale_uv,data_config.signal_scale_uv) or not math.isclose(data_config.window_seconds,encoder_config.spectral_window_seconds):
+            raise ValueError('Spectral residual sample rate, physical scale and window must match data')
     train_config = TrainConfig(**config.get('training', {}))
+    if encoder_config.spectral_modulation!='none' and not train_config.modulation_reference:
+        raise ValueError('Spectral modulation requires an audited W reference')
+    if train_config.modulation_reference and (encoder_config.record_fusion!='none' or encoder_config.spectral_fusion!='log' or initialization is not None):
+        raise ValueError('W modulation initialization requires standalone log model')
+    if bool(train_config.fusion_reference)!=(encoder_config.record_fusion!='none'):
+        raise ValueError('Protected record fusion requires its reference checkpoint')
+    if encoder_config.record_fusion!='none' and (train_config.metric_loss!='supcon' or train_config.ce_weight or train_config.local_power_mode!='none'):
+        raise ValueError('Record fusion uses SupCon without classifier or local power auxiliary')
+    if encoder_config.record_fusion=='single' and train_config.fusion_branch_weight!=0:
+        raise ValueError('Single expert control must not double its identity loss')
+    if train_config.local_power_mode!='none':
+        if encoder_config.window_pooling!='quality' or encoder_config.channel_gate!='none' or encoder_config.selection_mode!='none' or train_config.metric_loss!='supcon' or not train_config.cross_session:
+            raise ValueError('Local power study requires full ungated original pooling and cross-task SupCon')
+        from .local_power_drift import REGIONS
+        if any(name not in data_config.channel_names for group in REGIONS.values() for name in group):
+            raise ValueError('Local power policy requires explicit region electrode mapping')
+    if bool(train_config.window_reliability_weight)!=(encoder_config.window_pooling=='reliable'):
+        raise ValueError('Reliability pooling requires its auxiliary loss; controls must disable it')
+    if train_config.window_reliability_weight and not train_config.consistency_weight:
+        raise ValueError('Window reliability study reuses the existing paired corruption view')
     if train_config.early_stopping_evaluations and not episodes:
         raise ValueError('Early stopping requires development episodes')
     if encoder_config.quality_aware != (data_config.quality is not None):
@@ -231,10 +301,12 @@ def train(records, config_path, output, device, initialization=None, resume=None
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(train_config.seed)
     dataset = RecordingDataset(records, data_config, cache=train_config.cache_records,
-                               cache_max_bytes=train_config.cache_max_bytes)
+                               cache_max_bytes=train_config.cache_max_bytes,
+                               task_names=encoder_config.task_names if encoder_config.requires_task else ())
     sampler = SessionBatchSampler(
         records, train_config.identities_per_batch, train_config.samples_per_identity,
         train_config.steps_per_epoch, train_config.seed, train_config.cross_session,
+        train_config.same_session_batch,
     )
     # Validate all records and eligible blocks before optimization. Cache controls IO.
     for index in range(len(dataset)):
@@ -243,6 +315,31 @@ def train(records, config_path, output, device, initialization=None, resume=None
     prior_records, prior_development = [], []
     initialization_id, loaded_keys = None, []
     initial = None
+    if train_config.modulation_reference:
+        if checkpoint_id(train_config.modulation_reference)!=train_config.modulation_reference_sha256:
+            raise ValueError('W reference checksum changed')
+        initial,loaded_keys=_load_modulation_reference(encoder,train_config.modulation_reference,data_config)
+        if {r['record_id'] for r in initial['training_records']}!={r.record_id for r in records}:
+            raise ValueError('W reference training records differ')
+        prior_records=initial['training_records'];prior_development=initial.get('development_records',[])
+        initialization_id=train_config.modulation_reference_sha256
+    if encoder_config.record_fusion!='none':
+        if initialization is not None:
+            raise ValueError('Fusion reference and initialization cannot be combined')
+        if checkpoint_id(train_config.fusion_reference)!=train_config.fusion_reference_sha256:
+            raise ValueError('Fusion reference checksum changed')
+        initial,raw_keys=_load_initialization(encoder.record_fuser.raw,
+            train_config.fusion_reference,data_config,'strict')
+        mismatch=encoder.record_fuser.log.load_state_dict(initial['encoder_state'],strict=False)
+        if mismatch.unexpected_keys or any(not k.startswith('spectral_branch.') for k in mismatch.missing_keys):
+            raise ValueError('Log expert initialization must differ only by spectral branch')
+        # Every reference training record must belong to this audited training set.
+        if {r['record_id'] for r in initial['training_records']}!={r.record_id for r in records}:
+            raise ValueError('Fusion reference training records differ')
+        prior_records=initial['training_records']
+        prior_development=initial.get('development_records',[])
+        initialization_id=train_config.fusion_reference_sha256
+        loaded_keys=['record_fuser.raw.'+k for k in raw_keys]+['record_fuser.log.'+k for k in raw_keys]
     if initialization is not None:
         initial, loaded_keys = _load_initialization(encoder, initialization, data_config, init_mode)
         prior_records = initial['training_records']
@@ -300,7 +397,14 @@ def train(records, config_path, output, device, initialization=None, resume=None
     encoder.to(device).train()
     classifier = nn.Linear(encoder_config.embedding_dim, len(dataset.identities)).to(device)
     parameters = list(encoder.parameters()) + (list(classifier.parameters()) if train_config.ce_weight else [])
-    optimizer = torch.optim.AdamW(parameters, lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
+    optimization_parameters = parameters
+    if train_config.selector_lr_multiplier != 1:
+        if encoder_config.selection_mode not in ('learned_global','learned_task'):
+            raise ValueError('Separate selector learning rate requires a learned selector')
+        scores = encoder.selector.scores
+        optimization_parameters = [dict(params=[p for p in parameters if p is not scores]),
+            dict(params=[scores],lr=train_config.learning_rate*train_config.selector_lr_multiplier,weight_decay=0.)]
+    optimizer = torch.optim.AdamW(optimization_parameters, lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
     history, start_epoch, best_score, best_snapshot = [], 0, None, None
     if resumed is not None:
         if resumed['classifier_state'] is not None:
@@ -346,8 +450,20 @@ def train(records, config_path, output, device, initialization=None, resume=None
             epoch_started = perf_counter()
             sampler.epoch = epoch
             encoder.train()
+            if encoder_config.selection_mode != 'none':
+                encoder.selector.set_epoch(epoch)
             total = metric_total = ce_total = consistency_total = 0.0
+            gate_total = gate_min = gate_max = gate_saturation = 0.0
+            selection_entropy = 0.0
+            reliability_total=window_entropy=window_max_weight=0.0
+            clean_metric_total=drift_metric_total=drift_margin_total=0.0
+            fusion_branch_total=fusion_alpha_total=fusion_alpha_square_total=0.0
+            modulation_means=[];modulation_stds=[]
             for batch in loader:
+                tasks = None
+                if encoder_config.requires_task:
+                    *batch, tasks = batch
+                    tasks = tasks.to(device)
                 if encoder_config.quality_aware:
                     x, mask, quality, identities, sessions = batch
                     quality = quality.to(device)
@@ -357,7 +473,25 @@ def train(records, config_path, output, device, initialization=None, resume=None
                 x, mask = x.to(device), mask.to(device)
                 identities, sessions = identities.to(device), sessions.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                z = encoder(x, mask, quality) if quality is not None else encoder(x, mask)
+                pooling=None
+                if train_config.modulation_reference:
+                    z,modulation=encoder(x,mask,quality,return_modulation=True)
+                    groups=modulation['groups'].detach()
+                    modulation_means.append(groups.mean(0).cpu())
+                    modulation_stds.append(groups.std(0,unbiased=False).cpu())
+                elif encoder_config.record_fusion!='none':
+                    z,branches=encoder(x,mask,quality,return_branches=True)
+                elif encoder_config.window_pooling!='quality':
+                    z,pooling=encoder(x,mask,quality,tasks=tasks,return_pooling=True)
+                    window_entropy+=float(-(pooling['weights'].detach()*pooling['weights'].detach().clamp_min(1e-12).log()).sum(-1).mean())
+                    window_max_weight+=float(pooling['weights'].detach().max(-1).values.mean())
+                elif encoder_config.selection_mode != 'none':
+                    z, selection = encoder(x, mask, quality, tasks=tasks, return_selection=True)
+                    selection_entropy += float(selection['entropy'].detach())
+                elif encoder_config.channel_gate != 'none':
+                    z, gate = encoder(x, mask, quality, tasks=tasks, return_gate=True)
+                else:
+                    z = encoder(x, mask, quality) if quality is not None else encoder(x, mask)
                 if train_config.metric_loss == 'supcon':
                     metric = supervised_contrastive_loss(
                         z, identities, sessions, train_config.temperature, train_config.cross_session,
@@ -366,15 +500,52 @@ def train(records, config_path, output, device, initialization=None, resume=None
                     metric = pairwise_contrastive_loss(
                         z, identities, sessions, train_config.pair_margin, train_config.cross_session,
                     )
+                drift_margin=z.new_zeros(())
+                if train_config.local_power_mode!='none':
+                    from .local_power_drift import random_local_drift,preserve_identity_margin
+                    from .quality import QualityConfig,quality_weights
+                    shifted,_=random_local_drift(x,quality,data_config.channel_names,data_config.sample_rate,encoder_config.patch_samples)
+                    hard=(quality>0).repeat_interleave(encoder_config.patch_samples,-1)
+                    shifted_quality=quality_weights(shifted*data_config.signal_scale_uv,hard,QualityConfig(**data_config.quality))
+                    shifted_z=encoder(shifted,mask,shifted_quality)
+                    shifted_metric=supervised_contrastive_loss(shifted_z,identities,sessions,train_config.temperature,True)
+                    clean_metric_total+=float(metric.detach());drift_metric_total+=float(shifted_metric.detach())
+                    metric=.5*(metric+shifted_metric)
+                    if train_config.local_power_mode=='margin':
+                        drift_margin=preserve_identity_margin(z,shifted_z,identities,sessions)
+                        drift_margin_total+=float(drift_margin.detach())
                 ce = F.cross_entropy(16 * classifier(z), identities) if train_config.ce_weight else z.new_zeros(())
-                loss = metric + train_config.ce_weight * ce
+                loss = metric + train_config.ce_weight * ce+train_config.local_power_margin_weight*drift_margin
+                if encoder_config.record_fusion!='none':
+                    branch_loss=supervised_contrastive_loss(branches['log'],identities,sessions,
+                        train_config.temperature,train_config.cross_session)
+                    loss=loss+train_config.fusion_branch_weight*branch_loss
+                    fusion_branch_total+=float(branch_loss.detach())
+                    fusion_alpha_total+=float(branches['alpha'].detach().mean())
+                    fusion_alpha_square_total+=float(branches['alpha'].detach().square().mean())
+                if encoder_config.channel_gate != 'none':
+                    loss = loss + train_config.gate_regularization_weight * gate['regularizer']
+                    weights = gate['weights'].detach()[gate['active']]
+                    gate_total += float(gate['regularizer'].detach())
+                    gate_min += float(weights.min())
+                    gate_max += float(weights.max())
+                    gate_saturation += float(((weights < .51) | (weights > 1.49)).float().mean())
                 consistency = z.new_zeros(())
                 if train_config.consistency_weight:
                     from .quality import QualityConfig, corrupt_view
                     noisy, noisy_quality = corrupt_view(x, quality, QualityConfig(**data_config.quality),
                         data_config.signal_scale_uv, train_config.corruption_probability,
                         train_config.corruption_channel_fraction, train_config.corruption_noise_uv)
-                    noisy_z = encoder(noisy, mask, noisy_quality)
+                    if train_config.window_reliability_weight:
+                        noisy_z,noisy_pooling=encoder(noisy,mask,noisy_quality,tasks=tasks,return_pooling=True)
+                        from .window_pooling import reliability_constraint
+                        reliability,_=reliability_constraint(pooling,noisy_pooling,
+                            encoder_config.window_residual_mix,encoder_config.window_multiplier_bound,
+                            train_config.window_reliability_temperature)
+                        loss=loss+train_config.window_reliability_weight*reliability
+                        reliability_total+=float(reliability.detach())
+                    else:
+                        noisy_z = encoder(noisy, mask, noisy_quality, tasks=tasks)
                     consistency = (1 - (z * noisy_z).sum(-1)).clamp_min(0).mean()
                     loss = loss + train_config.consistency_weight * consistency
                 if not torch.isfinite(loss):
@@ -388,14 +559,39 @@ def train(records, config_path, output, device, initialization=None, resume=None
                 consistency_total += float(consistency.detach())
             entry = dict(epoch=epoch + 1, training_loss=total / len(loader),
                          metric_loss=metric_total / len(loader), ce_loss=ce_total / len(loader))
+            if train_config.modulation_reference:
+                entry.update(modulation_group_mean=torch.stack(modulation_means).mean(0).tolist(),
+                    modulation_within_batch_std=torch.stack(modulation_stds).mean(0).tolist())
+            if encoder_config.record_fusion!='none':
+                entry.update(fusion_branch_loss=fusion_branch_total/len(loader),
+                    fusion_alpha_mean=fusion_alpha_total/len(loader),
+                    fusion_alpha_std=math.sqrt(max(0.,fusion_alpha_square_total/len(loader)-(fusion_alpha_total/len(loader))**2)))
+            if encoder_config.selection_mode != 'none':
+                entry.update(selection_entropy=selection_entropy / len(loader),
+                             selection_temperature=float(encoder.selector.temperature),
+                             selection_noise_scale=(float(encoder.selector.noise_scale) if encoder_config.selection_mode in ('learned_global','learned_task') else 0.),
+                             selected_channels=encoder_config.selected_channels)
             if train_config.consistency_weight:
                 entry['consistency_loss'] = consistency_total / len(loader)
+            if encoder_config.window_pooling!='quality':
+                entry.update(window_entropy=window_entropy/len(loader),window_max_weight=window_max_weight/len(loader))
+            if train_config.window_reliability_weight:
+                entry['window_reliability_loss']=reliability_total/len(loader)
+            if train_config.local_power_mode!='none':
+                entry.update(clean_metric_loss=clean_metric_total/len(loader),local_power_metric_loss=drift_metric_total/len(loader))
+            if train_config.local_power_mode=='margin':entry['local_power_margin_loss']=drift_margin_total/len(loader)
+            if encoder_config.channel_gate != 'none':
+                entry.update(gate_regularizer=gate_total / len(loader),
+                             gate_mean_batch_min=gate_min / len(loader),
+                             gate_mean_batch_max=gate_max / len(loader),
+                             gate_saturation_fraction=gate_saturation / len(loader))
             improved = not episodes
             if episodes and ((epoch + 1) % train_config.eval_every == 0 or epoch + 1 == train_config.epochs):
                 from .evaluation import evaluate_development
                 encoder.eval()
-                development = (evaluate_development(encoder, data_config, episodes, device, closed_set=True)
-                               if dev_closed_set else evaluate_development(encoder, data_config, episodes, device))
+                evaluator = dev_evaluator or evaluate_development
+                development = (evaluator(encoder, data_config, episodes, device, closed_set=True)
+                               if dev_closed_set else evaluator(encoder, data_config, episodes, device))
                 entry['development'] = development
                 metrics = development['metrics']
                 score = [float(metrics['accuracy']), float(metrics.get('known_identification_rate') or 0)]
@@ -433,6 +629,8 @@ def train(records, config_path, output, device, initialization=None, resume=None
                         if isinstance(value, (int, float)) and math.isfinite(value):
                             writer.add_scalar(f'development/{name}', value, epoch + 1)
                 writer.flush()
+            with output.with_suffix('.timing.jsonl').open('a',encoding='utf-8') as timing:
+                timing.write(json.dumps(dict(epoch=epoch+1,seconds=perf_counter()-epoch_started))+'\n')
             if stop_reason:
                 print(f"early_stop epoch={epoch+1} reason={stop_reason} stale_evaluations={stopping['stale_evaluations']}", flush=True)
                 break

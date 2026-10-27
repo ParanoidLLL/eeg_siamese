@@ -20,3 +20,9 @@ dist/
 .env
 .env.*
 
+
+# Local research and runtime state
+/AGENTS.md
+/tmp/
+/.codex/
+/SHU_data/

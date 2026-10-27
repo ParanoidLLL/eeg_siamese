@@ -35,6 +35,9 @@ def load_encoder(path, device):
         raise ValueError("Unsupported checkpoint schema")
     encoder = EEGEncoder(EncoderConfig(**checkpoint["encoder_config"]))
     data_config = DataConfig(**checkpoint["data_config"])
+    if encoder.config.spectral_fusion!='none':
+        if not math.isclose(encoder.config.sample_rate,data_config.sample_rate) or not math.isclose(encoder.config.spectral_input_scale_uv,data_config.signal_scale_uv) or not math.isclose(data_config.window_seconds,encoder.config.spectral_window_seconds):
+            raise ValueError('Spectral residual physical configuration disagrees with data')
     if encoder.config.channels != len(data_config.channel_names):
         raise ValueError("Checkpoint channel configurations disagree")
     if encoder.config.quality_aware != (data_config.quality is not None):
@@ -62,6 +65,9 @@ def normalized_mean(vectors, weights=None):
 
 @torch.inference_mode()
 def encode_record(encoder, config, record, device):
+    tasks = None
+    if encoder.config.requires_task:
+        tasks = torch.tensor([encoder.task_index(record.task_id)], dtype=torch.long, device=device)
     loaded = load_windows(record, config)
     windows, valid = loaded[:2]
     vectors, weights = [], []
@@ -75,7 +81,7 @@ def encode_record(encoder, config, record, device):
             quality = pad_quality(loaded[2], start, config.block_windows)
             if not encoder.config.quality_soft_weights:
                 quality = (quality > 0).to(quality.dtype)
-            z = encoder(x.unsqueeze(0).to(device), mask.unsqueeze(0).to(device), quality.unsqueeze(0).to(device))
+            z = encoder(x.unsqueeze(0).to(device), mask.unsqueeze(0).to(device), quality.unsqueeze(0).to(device), tasks=tasks)
             weight = float(quality.sum())
         else:
             z = encoder(x.unsqueeze(0).to(device), mask.unsqueeze(0).to(device))

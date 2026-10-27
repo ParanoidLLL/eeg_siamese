@@ -17,7 +17,7 @@ jobs:
       - run: python -m build
       - name: Check wheel resources
         run: |
-          python -c "import glob, zipfile; z=zipfile.ZipFile(glob.glob('dist/*.whl')[0]); assert 'eeg_siamese/configs/axial_transformer.json' in z.namelist()"
+          python -c "import glob, zipfile; z=zipfile.ZipFile(glob.glob('dist/*.whl')[0]); assert all(p in z.namelist() for p in ['eeg_siamese/configs/axial_transformer.json', 'eeg_siamese/configs/w_openbmi.json', 'eeg_siamese/w_model.py'])"
       - name: Capture CI environment
         if: always()
         run: python scripts/capture_environment.py --output artifacts/ci-environment.json

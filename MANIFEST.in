@@ -1,0 +1,12 @@
+include README.md CHANGELOG.md pyproject.toml
+recursive-include configs *.json
+recursive-include examples *.csv
+recursive-include docs *.md *.json *.png
+recursive-include scripts *.py
+recursive-include tests *.py
+prune data
+prune artifacts
+prune reports
+prune tmp
+prune .venv
+global-exclude __pycache__ *.py[cod] .DS_Store

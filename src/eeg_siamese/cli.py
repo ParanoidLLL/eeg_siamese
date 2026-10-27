@@ -266,6 +266,15 @@ def audit_command(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="EEG Siamese training, registration and matching")
     commands = parser.add_subparsers(dest="command", required=True)
+    w = commands.add_parser('train-w', help='Training-only Q warmup and W log-residual continuation')
+    for key in ('manifest','config','output-dir'):
+        w.add_argument('--'+key, required=True)
+    w.add_argument('--device', default='auto')
+    w.add_argument('--warmup-epochs', type=int, help='Defaults to the continuation epoch budget in config')
+    w.add_argument('--control', action='store_true', help='Also train equal-budget waveform continuation U')
+    export = commands.add_parser('export-w', help='Export an existing W checkpoint as a single encoder')
+    export.add_argument('--checkpoint', required=True)
+    export.add_argument('--output', required=True)
     training = commands.add_parser("train")
     training.add_argument("--manifest", required=True)
     training.add_argument("--config", required=True)
@@ -341,7 +350,13 @@ def main(argv=None):
     fit.add_argument("--score-threshold", type=float, default=6.0)
     args = parser.parse_args(argv)
     try:
-        if args.command == "train":
+        if args.command == 'train-w':
+            from .w_model import train_w
+            print(json.dumps(train_w(args.manifest,args.config,args.output_dir,args.device,args.warmup_epochs,args.control)))
+        elif args.command == 'export-w':
+            from .w_model import export_w_checkpoint
+            print(json.dumps(export_w_checkpoint(args.checkpoint,args.output)))
+        elif args.command == "train":
             train(read_manifest(args.manifest), args.config, args.output, select_device(args.device),
                   args.init, resume=args.resume,
                   dev_episodes=load_episodes(args.dev_episodes, closed_set=args.dev_closed_set) if args.dev_episodes else None,
